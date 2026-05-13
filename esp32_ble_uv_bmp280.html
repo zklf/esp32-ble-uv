@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32 BLE UV + BMP280</title>
+
+<style>
+  body {
+    margin: 0;
+    font-family: Arial, "Microsoft YaHei", sans-serif;
+    background: #111827;
+    color: #f9fafb;
+  }
+
+  .container {
+    max-width: 1100px;
+    margin: auto;
+    padding: 18px;
+  }
+
+  h1 {
+    font-size: 24px;
+    margin-bottom: 8px;
+  }
+
+  .small {
+    font-size: 13px;
+    color: #9ca3af;
+    line-height: 1.6;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px;
+    margin-top: 14px;
+  }
+
+  .card {
+    background: #1f2937;
+    border-radius: 16px;
+    padding: 16px;
+    margin-top: 14px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+  }
+
+  .label {
+    color: #9ca3af;
+    font-size: 14px;
+  }
+
+  .value {
+    font-size: 32px;
+    font-weight: bold;
+    margin-top: 6px;
+  }
+
+  .unit {
+    font-size: 15px;
+    color: #9ca3af;
+  }
+
+  button {
+    border: none;
+    border-radius: 12px;
+    padding: 10px 14px;
+    margin: 5px 5px 5px 0;
+    background: #2563eb;
+    color: white;
+    font-size: 15px;
+    cursor: pointer;
+  }
+
+  button.danger {
+    background: #dc2626;
+  }
+
+  button.secondary {
+    background: #374151;
+  }
+
+  input {
+    width: 90px;
+    padding: 9px;
+    border-radius: 8px;
+    border: none;
+    margin: 4px 6px 4px 0;
+  }
+
+  canvas {
+    width: 100%;
+    height: 360px;
+    background: #0b1220;
+    border-radius: 16px;
+    margin-top: 14px;
+  }
+
+  pre {
+    white-space: pre-wrap;
+    word-break: break-all;
+    background: #0b1220;
+    padding: 12px;
+    border-radius: 12px;
+    color: #d1d5db;
+  }
+</style>
+</head>
+
+<body>
+<div class="container">
+  <h1>ESP32 BLE GATT 紫外线 + BMP280 监测</h1>
+
+  <div class="small">
+    网页通过 BLE GATT 连接 ESP32，不需要 WiFi。实时显示 UV、温度、气压、ADC 原始值，支持曲线和 CSV 保存。
+  </div>
+
+  <div class="card">
+    <button onclick="connectBLE()">连接 ESP32</button>
+    <button class="danger" onclick="disconnectBLE()">断开连接</button>
+    <button class="secondary" onclick="startRecord()">开始录制 CSV</button>
+    <button class="secondary" onclick="stopRecord()">停止录制</button>
+    <button onclick="downloadCSV()">下载 CSV</button>
+    <button class="secondary" onclick="clearData()">清空曲线</button>
+
+    <div class="small">
+      连接状态：<span id="connectState">未连接</span>；
+      录制状态：<span id="recordState">未录制</span>；
+      已记录：<span id="recordCount">0</span> 条
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="label">UV Index</div>
+      <div class="value"><span id="uvi">--</span></div>
+    </div>
+
+    <div class="card">
+      <div class="label">GUVA 电压</div>
+      <div class="value"><span id="voltage">--</span> <span class="unit">V</span></div>
+    </div>
+
+    <div class="card">
+      <div class="label">BMP280 温度</div>
+      <div class="value"><span id="temp">--</span> <span class="unit">°C</span></div>
+    </div>
+
+    <div class="card">
+      <div class="label">BMP280 气压</div>
+      <div class="value"><span id="press">--</span> <span class="unit">hPa</span></div>
+    </div>
+
+    <div class="card">
+      <div class="label">ADC 原始值</div>
+      <div class="value"><span id="raw">--</span></div>
+    </div>
+
+    <div class="card">
+      <div class="label">采样频率</div>
+      <div class="value"><span id="rate">--</span> <span class="unit">ms</span></div>
+    </div>
+  </div>
+
+  <canvas id="chart" width="1080" height="360"></canvas>
+
+  <div class="card">
+    <div class="label">控制参数</div>
+    <br>
+
+    <button onclick="sendZero()">设置当前 UV 为零点</button>
+    <br><br>
+
+    <span class="small">UVI 校准系数：</span><br>
+    <input id="calInput" type="number" step="0.01" value="10.00">
+    <button class="secondary" onclick="sendCal()">设置校准</button>
+
+    <br><br>
+
+    <span class="small">采样间隔 ms：</span><br>
+    <input id="rateInput" type="number" step="100" value="500">
+    <button class="secondary" onclick="sendRate()">设置采样频率</button>
+
+    <br><br>
+    <div class="small">
+      注意：采样间隔建议 200–1000 ms。太快时 BLE 通知和网页绘图可能不稳定。
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="label">最近收到的数据</div>
+    <pre id="log">暂无数据</pre>
+  </div>
+</div>
+
+<script>
+const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const DATA_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+const COMMAND_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+
+let bleDevice = null;
+let dataCharacteristic = null;
+let commandCharacteristic = null;
+
+let recording = false;
+let records = [];
+
+let maxPoints = 300;
+
+let timeData = [];
+let uviData = [];
+let tempData = [];
+let pressData = [];
+
+const canvas = document.getElementById("chart");
+const ctx = canvas.getContext("2d");
+
+function fixed2(x) {
+  if (x === undefined || x === null || isNaN(x)) return "--";
+  return Number(x).toFixed(2);
+}
+
+async function connectBLE() {
+  try {
+    if (!navigator.bluetooth) {
+      alert("当前浏览器不支持 Web Bluetooth。建议使用 Android Chrome 或电脑 Chrome/Edge。");
+      return;
+    }
+
+    bleDevice = await navigator.bluetooth.requestDevice({
+      filters: [
+        { namePrefix: "ESP32_UV_BMP" }
+      ],
+      optionalServices: [SERVICE_UUID]
+    });
+
+    bleDevice.addEventListener("gattserverdisconnected", onDisconnected);
+
+    const server = await bleDevice.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+
+    dataCharacteristic = await service.getCharacteristic(DATA_CHAR_UUID);
+    commandCharacteristic = await service.getCharacteristic(COMMAND_CHAR_UUID);
+
+    await dataCharacteristic.startNotifications();
+    dataCharacteristic.addEventListener("characteristicvaluechanged", onDataReceived);
+
+    document.getElementById("connectState").innerText = "已连接";
+  } catch (error) {
+    console.error(error);
+    alert("连接失败：" + error.message);
+  }
+}
+
+function disconnectBLE() {
+  if (bleDevice && bleDevice.gatt.connected) {
+    bleDevice.gatt.disconnect();
+  }
+}
+
+function onDisconnected() {
+  document.getElementById("connectState").innerText = "已断开";
+}
+
+function onDataReceived(event) {
+  const decoder = new TextDecoder("utf-8");
+  const text = decoder.decode(event.target.value);
+
+  let d;
+
+  try {
+    d = JSON.parse(text);
+  } catch (e) {
+    document.getElementById("log").innerText = "JSON 解析失败：\n" + text;
+    return;
+  }
+
+  const now = new Date();
+
+  document.getElementById("uvi").innerText = fixed2(d.uvi);
+  document.getElementById("voltage").innerText = fixed2(d.voltage);
+  document.getElementById("temp").innerText = fixed2(d.temp);
+  document.getElementById("press").innerText = fixed2(d.press);
+  document.getElementById("raw").innerText = d.raw;
+  document.getElementById("rate").innerText = d.rate;
+
+  document.getElementById("log").innerText =
+    "时间: " + now.toLocaleTimeString() + "\n" +
+    "原始数据: " + text + "\n\n" +
+    "UV Index: " + fixed2(d.uvi) + "\n" +
+    "GUVA 电压: " + fixed2(d.voltage) + " V\n" +
+    "温度: " + fixed2(d.temp) + " °C\n" +
+    "气压: " + fixed2(d.press) + " hPa\n" +
+    "ADC: " + d.raw + "\n" +
+    "校准系数: " + fixed2(d.cal) + "\n" +
+    "采样间隔: " + d.rate + " ms";
+
+  timeData.push(Date.now() / 1000);
+  uviData.push(Number(d.uvi));
+  tempData.push(Number(d.temp));
+  pressData.push(Number(d.press));
+
+  if (uviData.length > maxPoints) {
+    timeData.shift();
+    uviData.shift();
+    tempData.shift();
+    pressData.shift();
+  }
+
+  if (recording) {
+    records.push({
+      time: now.toISOString(),
+      ms: d.ms,
+      uvi: Number(d.uvi),
+      voltage: Number(d.voltage),
+      temperature: Number(d.temp),
+      pressure: Number(d.press),
+      raw: d.raw,
+      cal: Number(d.cal),
+      rate: d.rate
+    });
+
+    document.getElementById("recordCount").innerText = records.length;
+  }
+
+  drawChart();
+}
+
+async function writeCommand(cmd) {
+  if (!commandCharacteristic) {
+    alert("请先连接 ESP32");
+    return;
+  }
+
+  const encoder = new TextEncoder();
+  await commandCharacteristic.writeValue(encoder.encode(cmd));
+}
+
+async function sendZero() {
+  await writeCommand("ZERO");
+  alert("已发送 ZERO：当前 UV 电压将作为零点");
+}
+
+async function sendCal() {
+  const value = parseFloat(document.getElementById("calInput").value);
+
+  if (isNaN(value) || value <= 0) {
+    alert("请输入大于 0 的 UVI 校准系数");
+    return;
+  }
+
+  await writeCommand("CAL=" + value.toFixed(2));
+}
+
+async function sendRate() {
+  const value = parseInt(document.getElementById("rateInput").value);
+
+  if (isNaN(value) || value < 100 || value > 10000) {
+    alert("采样间隔建议设置在 100–10000 ms");
+    return;
+  }
+
+  await writeCommand("RATE=" + value);
+}
+
+function startRecord() {
+  recording = true;
+  document.getElementById("recordState").innerText = "录制中";
+}
+
+function stopRecord() {
+  recording = false;
+  document.getElementById("recordState").innerText = "已停止";
+}
+
+function downloadCSV() {
+  if (records.length === 0) {
+    alert("没有录制数据");
+    return;
+  }
+
+  let csv = "time,device_ms,uvi,voltage_V,temperature_C,pressure_hPa,raw_adc,calibration,rate_ms\n";
+
+  records.forEach(r => {
+    csv += [
+      r.time,
+      r.ms,
+      r.uvi.toFixed(2),
+      r.voltage.toFixed(2),
+      r.temperature.toFixed(2),
+      r.pressure.toFixed(2),
+      r.raw,
+      r.cal.toFixed(2),
+      r.rate
+    ].join(",") + "\n";
+  });
+
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "esp32_ble_uv_bmp280.csv";
+  a.click();
+
+  URL.revokeObjectURL(url);
+}
+
+function clearData() {
+  timeData = [];
+  uviData = [];
+  tempData = [];
+  pressData = [];
+  records = [];
+
+  document.getElementById("recordCount").innerText = "0";
+  document.getElementById("log").innerText = "暂无数据";
+
+  drawChart();
+}
+
+function drawChart() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  ctx.fillStyle = "#0b1220";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const padL = 60;
+  const padR = 90;
+  const padT = 30;
+  const padB = 45;
+
+  const w = canvas.width - padL - padR;
+  const h = canvas.height - padT - padB;
+
+  ctx.strokeStyle = "#4b5563";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(padL, padT);
+  ctx.lineTo(padL, padT + h);
+  ctx.lineTo(padL + w, padT + h);
+  ctx.stroke();
+
+  if (uviData.length < 2) {
+    ctx.fillStyle = "#9ca3af";
+    ctx.font = "14px Arial";
+    ctx.fillText("等待数据...", padL + 10, padT + 25);
+    return;
+  }
+
+  const allValues = [
+    ...uviData.filter(v => !isNaN(v)),
+    ...tempData.filter(v => !isNaN(v)),
+    ...pressData.filter(v => !isNaN(v)).map(v => v - 980)
+  ];
+
+  let ymin = Math.min(...allValues);
+  let ymax = Math.max(...allValues);
+
+  if (ymin > 0) ymin = 0;
+  if (ymax < 1) ymax = 1;
+
+  const margin = (ymax - ymin) * 0.15;
+  ymin -= margin;
+  ymax += margin;
+
+  function mapY(value) {
+    return padT + h - (value - ymin) / (ymax - ymin) * h;
+  }
+
+  function drawLine(data, transform, color) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+
+    for (let i = 0; i < data.length; i++) {
+      const value = transform(data[i]);
+      const px = padL + i / (maxPoints - 1) * w;
+      const py = mapY(value);
+
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+
+    ctx.stroke();
+  }
+
+  // 网页 Canvas 可以指定颜色，便于区分三条曲线
+  // 蓝：UVI，橙：温度，绿：气压偏移值
+  drawLine(uviData, v => v, "#60a5fa");
+  drawLine(tempData, v => v, "#f59e0b");
+  drawLine(pressData, v => v - 980, "#34d399");
+
+  ctx.fillStyle = "#9ca3af";
+  ctx.font = "12px Arial";
+
+  for (let i = 0; i <= 5; i++) {
+    const yv = ymin + (ymax - ymin) * i / 5;
+    const py = mapY(yv);
+
+    ctx.strokeStyle = "#1f2937";
+    ctx.beginPath();
+    ctx.moveTo(padL, py);
+    ctx.lineTo(padL + w, py);
+    ctx.stroke();
+
+    ctx.fillStyle = "#9ca3af";
+    ctx.fillText(yv.toFixed(1), 8, py + 4);
+  }
+
+  ctx.fillStyle = "#f9fafb";
+  ctx.font = "14px Arial";
+  ctx.fillText("实时曲线：UV Index / 温度 / 气压偏移值", padL, 20);
+
+  ctx.fillStyle = "#60a5fa";
+  ctx.fillText("UV", padL + w + 15, padT + 20);
+
+  ctx.fillStyle = "#f59e0b";
+  ctx.fillText("Temp", padL + w + 15, padT + 42);
+
+  ctx.fillStyle = "#34d399";
+  ctx.fillText("Press-980", padL + w + 15, padT + 64);
+
+  ctx.fillStyle = "#9ca3af";
+  ctx.fillText("说明：气压曲线显示 pressure - 980，便于和 UV、温度放在同一坐标轴。", padL, padT + h + 32);
+}
+
+drawChart();
+</script>
+</body>
+</html>
