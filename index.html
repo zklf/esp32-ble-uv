@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ESP32 BLE UV + BMP280</title>
+<title>ESP32 BLE UV + BMP280 + SGP40</title>
 
 <style>
   body {
@@ -14,7 +14,7 @@
   }
 
   .container {
-    max-width: 1100px;
+    max-width: 1180px;
     margin: auto;
     padding: 18px;
   }
@@ -32,7 +32,7 @@
 
   .grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
     gap: 12px;
     margin-top: 14px;
   }
@@ -51,7 +51,7 @@
   }
 
   .value {
-    font-size: 32px;
+    font-size: 30px;
     font-weight: bold;
     margin-top: 6px;
   }
@@ -81,7 +81,7 @@
   }
 
   input {
-    width: 90px;
+    width: 105px;
     padding: 9px;
     border-radius: 8px;
     border: none;
@@ -90,7 +90,7 @@
 
   canvas {
     width: 100%;
-    height: 360px;
+    height: 430px;
     background: #0b1220;
     border-radius: 16px;
     margin-top: 14px;
@@ -109,10 +109,10 @@
 
 <body>
 <div class="container">
-  <h1>ESP32 BLE GATT 紫外线 + BMP280 监测</h1>
+  <h1>ESP32 BLE GATT 紫外线 + BMP280 + SGP40 监测</h1>
 
   <div class="small">
-    网页通过 BLE GATT 连接 ESP32，不需要 WiFi。实时显示 UV、温度、气压、ADC 原始值，支持曲线和 CSV 保存。
+    网页通过 BLE GATT 连接 ESP32，不需要 WiFi。UV、温度、气压使用左侧 Y 轴，SGP40 VOC Index 使用右侧 Y 轴，X 轴为秒数。
   </div>
 
   <div class="card">
@@ -132,7 +132,7 @@
 
   <div class="grid">
     <div class="card">
-      <div class="label">UV Index</div>
+      <div class="label">估算 UV Index</div>
       <div class="value"><span id="uvi">--</span></div>
     </div>
 
@@ -157,18 +157,34 @@
     </div>
 
     <div class="card">
-      <div class="label">采样频率</div>
+      <div class="label">SGP40 VOC Index</div>
+      <div class="value"><span id="voc">--</span></div>
+    </div>
+
+    <div class="card">
+      <div class="label">SGP40 Raw</div>
+      <div class="value"><span id="sgpRaw">--</span></div>
+    </div>
+
+    <div class="card">
+      <div class="label">VOC 湿度补偿</div>
+      <div class="value"><span id="rh">--</span> <span class="unit">%RH</span></div>
+    </div>
+
+    <div class="card">
+      <div class="label">采样间隔</div>
       <div class="value"><span id="rate">--</span> <span class="unit">ms</span></div>
     </div>
   </div>
 
-  <canvas id="chart" width="1080" height="360"></canvas>
+  <canvas id="chart" width="1140" height="430"></canvas>
 
   <div class="card">
     <div class="label">控制参数</div>
     <br>
 
     <button onclick="sendZero()">设置当前 UV 为零点</button>
+
     <br><br>
 
     <span class="small">UVI 校准系数：</span><br>
@@ -178,12 +194,19 @@
     <br><br>
 
     <span class="small">采样间隔 ms：</span><br>
-    <input id="rateInput" type="number" step="100" value="500">
+    <input id="rateInput" type="number" step="100" value="1000">
     <button class="secondary" onclick="sendRate()">设置采样频率</button>
 
     <br><br>
+
+    <span class="small">VOC 湿度补偿，单位 %RH：</span><br>
+    <input id="rhInput" type="number" step="0.1" value="50.0">
+    <button class="secondary" onclick="sendRH()">设置 VOC 湿度补偿</button>
+
+    <br><br>
+
     <div class="small">
-      注意：采样间隔建议 200–1000 ms。太快时 BLE 通知和网页绘图可能不稳定。
+      SGP40 没有湿度传感器时，可以手动输入环境相对湿度。温度补偿使用 BMP280 温度，且 ESP32 端已做 -1.40 °C 修正。
     </div>
   </div>
 
@@ -207,10 +230,12 @@ let records = [];
 
 let maxPoints = 300;
 
-let timeData = [];
+let t0 = null;
+let xData = [];
 let uviData = [];
 let tempData = [];
 let pressData = [];
+let vocData = [];
 
 const canvas = document.getElementById("chart");
 const ctx = canvas.getContext("2d");
@@ -218,6 +243,30 @@ const ctx = canvas.getContext("2d");
 function fixed2(x) {
   if (x === undefined || x === null || isNaN(x)) return "--";
   return Number(x).toFixed(2);
+}
+
+function parsePayload(text) {
+  // ESP32 发送：
+  // ms,uvi,voltage,temp,press,raw,voc,rh,sgpRaw,cal,rate
+  const p = text.trim().split(",");
+
+  if (p.length < 11) {
+    throw new Error("字段数量不足：" + p.length);
+  }
+
+  return {
+    ms: Number(p[0]),
+    uvi: Number(p[1]),
+    voltage: Number(p[2]),
+    temp: Number(p[3]),
+    press: Number(p[4]),
+    raw: Number(p[5]),
+    voc: Number(p[6]),
+    rh: Number(p[7]),
+    sgpRaw: Number(p[8]),
+    cal: Number(p[9]),
+    rate: Number(p[10])
+  };
 }
 
 async function connectBLE() {
@@ -229,7 +278,7 @@ async function connectBLE() {
 
     bleDevice = await navigator.bluetooth.requestDevice({
       filters: [
-        { namePrefix: "ESP32_UV_BMP" }
+        { namePrefix: "ESP32_UV_BMP_SGP40" }
       ],
       optionalServices: [SERVICE_UUID]
     });
@@ -269,9 +318,10 @@ function onDataReceived(event) {
   let d;
 
   try {
-    d = JSON.parse(text);
+    d = parsePayload(text);
   } catch (e) {
-    document.getElementById("log").innerText = "JSON 解析失败：\n" + text;
+    document.getElementById("log").innerText =
+      "数据解析失败：\n" + text + "\n\n" + e.message;
     return;
   }
 
@@ -282,6 +332,9 @@ function onDataReceived(event) {
   document.getElementById("temp").innerText = fixed2(d.temp);
   document.getElementById("press").innerText = fixed2(d.press);
   document.getElementById("raw").innerText = d.raw;
+  document.getElementById("voc").innerText = d.voc >= 0 ? d.voc : "--";
+  document.getElementById("sgpRaw").innerText = d.sgpRaw;
+  document.getElementById("rh").innerText = fixed2(d.rh);
   document.getElementById("rate").innerText = d.rate;
 
   document.getElementById("log").innerText =
@@ -292,30 +345,45 @@ function onDataReceived(event) {
     "温度: " + fixed2(d.temp) + " °C\n" +
     "气压: " + fixed2(d.press) + " hPa\n" +
     "ADC: " + d.raw + "\n" +
-    "校准系数: " + fixed2(d.cal) + "\n" +
+    "VOC Index: " + (d.voc >= 0 ? d.voc : "--") + "\n" +
+    "SGP40 Raw: " + d.sgpRaw + "\n" +
+    "VOC 湿度补偿: " + fixed2(d.rh) + " %RH\n" +
+    "UVI 校准系数: " + fixed2(d.cal) + "\n" +
     "采样间隔: " + d.rate + " ms";
 
-  timeData.push(Date.now() / 1000);
+  if (t0 === null) {
+    t0 = d.ms;
+  }
+
+  const sec = (d.ms - t0) / 1000.0;
+
+  xData.push(sec);
   uviData.push(Number(d.uvi));
   tempData.push(Number(d.temp));
   pressData.push(Number(d.press));
+  vocData.push(Number(d.voc));
 
-  if (uviData.length > maxPoints) {
-    timeData.shift();
+  if (xData.length > maxPoints) {
+    xData.shift();
     uviData.shift();
     tempData.shift();
     pressData.shift();
+    vocData.shift();
   }
 
   if (recording) {
     records.push({
       time: now.toISOString(),
+      seconds: sec,
       ms: d.ms,
       uvi: Number(d.uvi),
       voltage: Number(d.voltage),
       temperature: Number(d.temp),
       pressure: Number(d.press),
       raw: d.raw,
+      voc: Number(d.voc),
+      rh: Number(d.rh),
+      sgpRaw: d.sgpRaw,
       cal: Number(d.cal),
       rate: d.rate
     });
@@ -355,12 +423,23 @@ async function sendCal() {
 async function sendRate() {
   const value = parseInt(document.getElementById("rateInput").value);
 
-  if (isNaN(value) || value < 100 || value > 10000) {
-    alert("采样间隔建议设置在 100–10000 ms");
+  if (isNaN(value) || value < 200 || value > 10000) {
+    alert("采样间隔建议设置在 200–10000 ms");
     return;
   }
 
   await writeCommand("RATE=" + value);
+}
+
+async function sendRH() {
+  const value = parseFloat(document.getElementById("rhInput").value);
+
+  if (isNaN(value) || value < 0 || value > 100) {
+    alert("湿度补偿请输入 0–100 之间的数值");
+    return;
+  }
+
+  await writeCommand("RH=" + value.toFixed(2));
 }
 
 function startRecord() {
@@ -379,17 +458,21 @@ function downloadCSV() {
     return;
   }
 
-  let csv = "time,device_ms,uvi,voltage_V,temperature_C,pressure_hPa,raw_adc,calibration,rate_ms\n";
+  let csv = "time,seconds,device_ms,uvi,voltage_V,temperature_C,pressure_hPa,raw_adc,voc_index,voc_humidity_RH,sgp40_raw,calibration,rate_ms\n";
 
   records.forEach(r => {
     csv += [
       r.time,
+      r.seconds.toFixed(2),
       r.ms,
       r.uvi.toFixed(2),
       r.voltage.toFixed(2),
       r.temperature.toFixed(2),
       r.pressure.toFixed(2),
       r.raw,
+      r.voc,
+      r.rh.toFixed(2),
+      r.sgpRaw,
       r.cal.toFixed(2),
       r.rate
     ].join(",") + "\n";
@@ -400,17 +483,21 @@ function downloadCSV() {
 
   const a = document.createElement("a");
   a.href = url;
-  a.download = "esp32_ble_uv_bmp280.csv";
+  a.download = "esp32_ble_uv_bmp280_sgp40.csv";
   a.click();
 
   URL.revokeObjectURL(url);
 }
 
 function clearData() {
-  timeData = [];
+  t0 = null;
+
+  xData = [];
   uviData = [];
   tempData = [];
   pressData = [];
+  vocData = [];
+
   records = [];
 
   document.getElementById("recordCount").innerText = "0";
@@ -425,78 +512,91 @@ function drawChart() {
   ctx.fillStyle = "#0b1220";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  const padL = 60;
-  const padR = 90;
-  const padT = 30;
-  const padB = 45;
+  const padL = 65;
+  const padR = 75;
+  const padT = 35;
+  const padB = 55;
 
   const w = canvas.width - padL - padR;
   const h = canvas.height - padT - padB;
 
+  // 外框轴线
   ctx.strokeStyle = "#4b5563";
   ctx.lineWidth = 1;
+
   ctx.beginPath();
   ctx.moveTo(padL, padT);
   ctx.lineTo(padL, padT + h);
   ctx.lineTo(padL + w, padT + h);
+  ctx.lineTo(padL + w, padT);
   ctx.stroke();
 
-  if (uviData.length < 2) {
+  if (xData.length < 2) {
     ctx.fillStyle = "#9ca3af";
     ctx.font = "14px Arial";
-    ctx.fillText("等待数据...", padL + 10, padT + 25);
+    ctx.fillText("等待 BLE 数据...", padL + 10, padT + 25);
     return;
   }
 
-  const allValues = [
+  // 左轴数据：UV、温度、气压偏移值
+  // 气压用 press - 980，便于和温度、UV 放在同一坐标轴
+  const leftValues = [
     ...uviData.filter(v => !isNaN(v)),
     ...tempData.filter(v => !isNaN(v)),
     ...pressData.filter(v => !isNaN(v)).map(v => v - 980)
   ];
 
-  let ymin = Math.min(...allValues);
-  let ymax = Math.max(...allValues);
+  let leftMin = Math.min(...leftValues);
+  let leftMax = Math.max(...leftValues);
 
-  if (ymin > 0) ymin = 0;
-  if (ymax < 1) ymax = 1;
-
-  const margin = (ymax - ymin) * 0.15;
-  ymin -= margin;
-  ymax += margin;
-
-  function mapY(value) {
-    return padT + h - (value - ymin) / (ymax - ymin) * h;
+  if (!isFinite(leftMin) || !isFinite(leftMax)) {
+    leftMin = 0;
+    leftMax = 1;
   }
 
-  function drawLine(data, transform, color) {
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
+  if (leftMin > 0) leftMin = 0;
+  if (leftMax < 1) leftMax = 1;
 
-    for (let i = 0; i < data.length; i++) {
-      const value = transform(data[i]);
-      const px = padL + i / (maxPoints - 1) * w;
-      const py = mapY(value);
+  let leftMargin = (leftMax - leftMin) * 0.15;
+  if (leftMargin <= 0) leftMargin = 1;
 
-      if (i === 0) ctx.moveTo(px, py);
-      else ctx.lineTo(px, py);
-    }
+  leftMin -= leftMargin;
+  leftMax += leftMargin;
 
-    ctx.stroke();
+  // 右轴数据：VOC Index
+  const validVoc = vocData.filter(v => !isNaN(v) && v >= 0);
+
+  let rightMin = 0;
+  let rightMax = 500;
+
+  if (validVoc.length > 0) {
+    rightMax = Math.max(100, ...validVoc) * 1.15;
+    if (rightMax > 500) rightMax = Math.ceil(rightMax / 50) * 50;
   }
 
-  // 网页 Canvas 可以指定颜色，便于区分三条曲线
-  // 蓝：UVI，橙：温度，绿：气压偏移值
-  drawLine(uviData, v => v, "#60a5fa");
-  drawLine(tempData, v => v, "#f59e0b");
-  drawLine(pressData, v => v - 980, "#34d399");
+  const xMin = xData[0];
+  const xMax = xData[xData.length - 1];
 
-  ctx.fillStyle = "#9ca3af";
+  function mapX(sec) {
+    if (xMax === xMin) return padL;
+    return padL + (sec - xMin) / (xMax - xMin) * w;
+  }
+
+  function mapYLeft(value) {
+    return padT + h - (value - leftMin) / (leftMax - leftMin) * h;
+  }
+
+  function mapYRight(value) {
+    return padT + h - (value - rightMin) / (rightMax - rightMin) * h;
+  }
+
+  // 网格和左 Y 轴标签
   ctx.font = "12px Arial";
+  ctx.fillStyle = "#9ca3af";
 
   for (let i = 0; i <= 5; i++) {
-    const yv = ymin + (ymax - ymin) * i / 5;
-    const py = mapY(yv);
+    const lv = leftMin + (leftMax - leftMin) * i / 5;
+    const py = mapYLeft(lv);
 
     ctx.strokeStyle = "#1f2937";
     ctx.beginPath();
@@ -505,24 +605,89 @@ function drawChart() {
     ctx.stroke();
 
     ctx.fillStyle = "#9ca3af";
-    ctx.fillText(yv.toFixed(1), 8, py + 4);
+    ctx.fillText(lv.toFixed(1), 8, py + 4);
+
+    const rv = rightMin + (rightMax - rightMin) * i / 5;
+    ctx.fillText(rv.toFixed(0), padL + w + 10, py + 4);
   }
 
+  // X 轴秒数标签
+  const xTicks = 5;
+  for (let i = 0; i <= xTicks; i++) {
+    const xv = xMin + (xMax - xMin) * i / xTicks;
+    const px = mapX(xv);
+
+    ctx.strokeStyle = "#1f2937";
+    ctx.beginPath();
+    ctx.moveTo(px, padT);
+    ctx.lineTo(px, padT + h);
+    ctx.stroke();
+
+    ctx.fillStyle = "#9ca3af";
+    ctx.fillText(xv.toFixed(0) + "s", px - 12, padT + h + 22);
+  }
+
+  function drawLine(data, mapper, transform, color) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+
+    let started = false;
+
+    for (let i = 0; i < data.length; i++) {
+      let v = transform(data[i]);
+
+      if (isNaN(v)) continue;
+
+      const px = mapX(xData[i]);
+      const py = mapper(v);
+
+      if (!started) {
+        ctx.moveTo(px, py);
+        started = true;
+      } else {
+        ctx.lineTo(px, py);
+      }
+    }
+
+    ctx.stroke();
+  }
+
+  // 曲线颜色
+  drawLine(uviData, mapYLeft, v => v, "#60a5fa");          // UV
+  drawLine(tempData, mapYLeft, v => v, "#f59e0b");         // 温度
+  drawLine(pressData, mapYLeft, v => v - 980, "#34d399");  // 气压偏移
+  drawLine(vocData, mapYRight, v => v, "#f472b6");         // VOC，右轴
+
+  // 标题
   ctx.fillStyle = "#f9fafb";
   ctx.font = "14px Arial";
-  ctx.fillText("实时曲线：UV Index / 温度 / 气压偏移值", padL, 20);
+  ctx.fillText("实时曲线：左轴 UV / 温度 / 气压偏移值，右轴 SGP40 VOC Index，X 轴为秒数", padL, 22);
+
+  // 图例
+  const legendX = padL + 10;
+  const legendY = padT + 18;
+
+  ctx.font = "13px Arial";
 
   ctx.fillStyle = "#60a5fa";
-  ctx.fillText("UV", padL + w + 15, padT + 20);
+  ctx.fillText("UV Index", legendX, legendY);
 
   ctx.fillStyle = "#f59e0b";
-  ctx.fillText("Temp", padL + w + 15, padT + 42);
+  ctx.fillText("Temp °C", legendX + 85, legendY);
 
   ctx.fillStyle = "#34d399";
-  ctx.fillText("Press-980", padL + w + 15, padT + 64);
+  ctx.fillText("Pressure - 980", legendX + 165, legendY);
 
+  ctx.fillStyle = "#f472b6";
+  ctx.fillText("VOC Index 右轴", legendX + 290, legendY);
+
+  // 轴说明
   ctx.fillStyle = "#9ca3af";
-  ctx.fillText("说明：气压曲线显示 pressure - 980，便于和 UV、温度放在同一坐标轴。", padL, padT + h + 32);
+  ctx.font = "12px Arial";
+  ctx.fillText("左 Y 轴：UV / 温度 / 气压-980", 10, padT - 10);
+  ctx.fillText("右 Y 轴：VOC Index", padL + w - 20, padT - 10);
+  ctx.fillText("X 轴：秒", padL + w - 35, padT + h + 42);
 }
 
 drawChart();
